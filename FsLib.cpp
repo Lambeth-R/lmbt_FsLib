@@ -9,13 +9,15 @@
 #endif
 #include <algorithm>
 #include <Shlwapi.h>
+#include <userenv.h>
 #if _HAS_CXX17
 #include <string_view>
 #endif
 #pragma comment(lib, "Shlwapi.lib")
+#pragma comment(lib, "Userenv.lib")
 #pragma warning(disable : 5051)
 
-const fs::path Fs_GetDosStylePath(const fs::path& path)
+const fs::path Fs_GetMountPointPath(const fs::path& path)
 {
 #if _HAS_CXX17
     if (std::wstring_view(path.c_str()).substr(0, 4) == L"\\\\?\\")
@@ -44,10 +46,27 @@ const fs::path Fs_ExpandPath(const fs::path& path)
     {
         return path;
     }
-    auto dw_len = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
-    std::unique_ptr<wchar_t[]> tmp_buf(new wchar_t[dw_len + 1]);
-    dw_len = GetFullPathNameW(path.c_str(), dw_len, tmp_buf.get(), nullptr);
-    if (dw_len)
+    HANDLE self_process_handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, GetCurrentProcessId());
+    if (!self_process_handle && self_process_handle == INVALID_HANDLE_VALUE)
+    {
+        return path;
+    }
+    HANDLE self_token_handle = INVALID_HANDLE_VALUE;
+    std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) {
+        if (self_token_handle && self_token_handle != INVALID_HANDLE_VALUE) { CloseHandle(self_token_handle); self_token_handle = nullptr; }
+        if (self_process_handle && self_process_handle != INVALID_HANDLE_VALUE) { CloseHandle(self_process_handle); self_process_handle = nullptr; }}};
+    if (!self_process_handle || self_process_handle == INVALID_HANDLE_VALUE)
+    {
+        return path;
+    }
+    BOOL res = OpenProcessToken(self_process_handle, TOKEN_IMPERSONATE | TOKEN_QUERY, &self_token_handle);
+    if (!res || !self_token_handle || self_token_handle == INVALID_HANDLE_VALUE)
+    {
+        return path;
+    }
+    std::unique_ptr<wchar_t[]> tmp_buf(new wchar_t[MAX_PATH - 1]);
+    res = ExpandEnvironmentStringsForUserW(self_token_handle, path.c_str(), tmp_buf.get(), MAX_PATH - 1);
+    if (res)
     {
         return tmp_buf.get();
     }
@@ -56,7 +75,7 @@ const fs::path Fs_ExpandPath(const fs::path& path)
 
 bool Fs_WriteFile(const fs::path& filePath, const std::string& data, bool force)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(filePath);
+    fs::path expanded_path = Fs_GetMountPointPath(filePath);
     DWORD attributes = force ? CREATE_ALWAYS : CREATE_NEW;
     auto h_File = CreateFileW(expanded_path.c_str(), GENERIC_WRITE, 0, nullptr, attributes, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
@@ -74,7 +93,7 @@ bool Fs_WriteFile(const fs::path& filePath, const std::string& data, bool force)
 
 bool Fs_ReadFile(const fs::path& filePath, std::string& data)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(filePath);
+    fs::path expanded_path = Fs_GetMountPointPath(filePath);
     auto h_File = CreateFileW(expanded_path.c_str(), GENERIC_READ, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
@@ -101,7 +120,7 @@ bool Fs_ReadFile(const fs::path& filePath, std::string& data)
 
 bool Fs_AppendFile(const fs::path& filePath, const std::string& data)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(filePath);
+    fs::path expanded_path = Fs_GetMountPointPath(filePath);
     auto h_File = CreateFileW(expanded_path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
@@ -123,7 +142,7 @@ bool Fs_AppendFile(const fs::path& filePath, const std::string& data)
 
 bool Fs_DeleteFile(const fs::path& filePath)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(filePath);
+    fs::path expanded_path = Fs_GetMountPointPath(filePath);
     if (!DeleteFileW(expanded_path.c_str()))
     {
         return false;
@@ -133,7 +152,7 @@ bool Fs_DeleteFile(const fs::path& filePath)
 
 bool Fs_RemoveDir(const fs::path& path, bool recursive)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(path);
+    fs::path expanded_path = Fs_GetMountPointPath(path);
     if (!Fs_IsDirectory(expanded_path))
     {
         expanded_path = expanded_path.parent_path();
@@ -166,7 +185,7 @@ bool Fs_RemoveDir(const fs::path& path, bool recursive)
 
 bool Fs_IsDirectory(const fs::path& path)
 {
-    const auto& expanded_path = Fs_GetDosStylePath(path);
+    const auto& expanded_path = Fs_GetMountPointPath(path);
     if (GetFileAttributesW(expanded_path.c_str()) & FILE_ATTRIBUTE_DIRECTORY)
     {
         return true;
@@ -176,7 +195,7 @@ bool Fs_IsDirectory(const fs::path& path)
 
 bool Fs_IsExist(const fs::path& path)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(path);
+    fs::path expanded_path = Fs_GetMountPointPath(path);
     DWORD dw_attrib = GetFileAttributesW(expanded_path.c_str());
     bool exist = (dw_attrib != INVALID_FILE_ATTRIBUTES && (dw_attrib & FILE_ATTRIBUTE_DIRECTORY));
     if (!exist)
@@ -194,7 +213,7 @@ bool Fs_IsExist(const fs::path& path)
 
 bool Fs_CreateDirectory(const fs::path& path, bool recirsive)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(path);
+    fs::path expanded_path = Fs_GetMountPointPath(path);
     while(!Fs_IsExist(expanded_path.parent_path()) && recirsive)
     {
         if (!Fs_CreateDirectory(expanded_path.parent_path()))
@@ -211,7 +230,7 @@ bool Fs_CreateDirectory(const fs::path& path, bool recirsive)
 
 bool Fs_GetFileMetadata(const fs::path& path, fs::File_Metadata& attributes)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(path);
+    fs::path expanded_path = Fs_GetMountPointPath(path);
     auto h_File = CreateFileW(expanded_path.c_str(), FILE_READ_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
@@ -233,7 +252,7 @@ bool Fs_GetFileMetadata(const fs::path& path, fs::File_Metadata& attributes)
 
 bool Fs_SetFileMetadata(const fs::path& path, const fs::File_Metadata& attributes)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(path);
+    fs::path expanded_path = Fs_GetMountPointPath(path);
     auto h_File = CreateFileW(expanded_path.c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
@@ -255,7 +274,7 @@ bool Fs_SetFileMetadata(const fs::path& path, const fs::File_Metadata& attribute
 
 const std::vector<fs::path> Fs_EnumDir(const fs::path& path)
 {
-    fs::path expanded_path = Fs_GetDosStylePath(path);
+    fs::path expanded_path = Fs_GetMountPointPath(path);
     if (!Fs_IsDirectory(expanded_path))
     {
         expanded_path = expanded_path.parent_path();
