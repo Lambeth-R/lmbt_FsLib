@@ -1,89 +1,67 @@
-﻿#include "../Include/FsLib.h"
-#include "../Include/Common.h"
-#include "../Include/LogClass.h"
-#ifdef max
-#undef max
-#endif
-#ifdef min
-#undef min
-#endif
+﻿#include "FsLib.h"
+
 #include <algorithm>
-#include <Shlwapi.h>
-#include <userenv.h>
-#if _HAS_CXX17
+#if _CPP_VERSION >= 201703L
 #include <string_view>
 #endif
+#include <regex>
+
+#ifdef _MSC_VER
+#include <Shlwapi.h>
+#include <userenv.h>
 #pragma comment(lib, "Shlwapi.lib")
 #pragma comment(lib, "Userenv.lib")
-#pragma warning(disable : 5051)
 
-const fs::path Fs_GetMountPointPath(const fs::path& path)
+LIB_EXPORT
+const fs::path Fs_GetMountPointPath(const fs::path &Path)
 {
-#if _HAS_CXX17
-    if (std::wstring_view(path.c_str()).substr(0, 4) == L"\\\\?\\")
-    {
-        return path;
-    }
-#else
-    if (std::wstring(path.c_str()).substr(0, 4) == L"\\\\?\\")
-    {
-        return path;
-    }
-#endif
-    const auto &expanded_path = Fs_ExpandPath(path);
+    const auto &expanded_path = Fs_ExpandPath(Path);
     wchar_t dev_path[50]; // 50 is max
-    const auto& letter = expanded_path.wstring().substr(0, 3);
+    const size_t letter_off = expanded_path.wstring().find_first_of(L":") + 2;
+    const auto& letter = expanded_path.wstring().substr(0, letter_off + 2);
     if (!GetVolumeNameForVolumeMountPointW(letter.c_str(), dev_path, 50))
     {
         return expanded_path;
     }
-    return fs::path(dev_path) / expanded_path.wstring().substr(3);
+    return fs::path(dev_path);
 }
 
-const fs::path Fs_ExpandPath(const fs::path& path)
+LIB_EXPORT
+const fs::path Fs_ExpandPath(const fs::path &Path)
 {
-    if (!path.is_relative())
+    static const wchar_t       dos_prefix[] = L"\\\\?\\";
+    static const size_t        dos_pref_sz  = sizeof(dos_prefix) / sizeof(wchar_t);
+           const std::wstring &w_path       = Path.wstring();
+    if (w_path.size() > dos_pref_sz && std::char_traits<wchar_t>::compare(w_path.substr(0,4).data(), dos_prefix, dos_pref_sz) == 0)
     {
-        return path;
+        return Path;
     }
-    HANDLE self_process_handle = OpenProcess(PROCESS_QUERY_INFORMATION, false, GetCurrentProcessId());
-    if (!self_process_handle && self_process_handle == INVALID_HANDLE_VALUE)
+    if (DWORD len = GetFullPathNameW(Path.wstring().c_str(), 0, 0, 0))
     {
-        return path;
+        wchar_t *c;
+        std::wstring tmp_str(dos_prefix);
+        tmp_str.resize(len + 4,L' ');
+        if (len - 1 == GetFullPathNameW(Path.wstring().c_str(), len, tmp_str.data() + 4, &c))
+        {
+            tmp_str.resize(len + 3);
+            return tmp_str;
+        }
     }
-    HANDLE self_token_handle = INVALID_HANDLE_VALUE;
-    std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) {
-        if (self_token_handle && self_token_handle != INVALID_HANDLE_VALUE) { CloseHandle(self_token_handle); self_token_handle = nullptr; }
-        if (self_process_handle && self_process_handle != INVALID_HANDLE_VALUE) { CloseHandle(self_process_handle); self_process_handle = nullptr; }}};
-    if (!self_process_handle || self_process_handle == INVALID_HANDLE_VALUE)
-    {
-        return path;
-    }
-    BOOL res = OpenProcessToken(self_process_handle, TOKEN_IMPERSONATE | TOKEN_QUERY, &self_token_handle);
-    if (!res || !self_token_handle || self_token_handle == INVALID_HANDLE_VALUE)
-    {
-        return path;
-    }
-    std::unique_ptr<wchar_t[]> tmp_buf(new wchar_t[MAX_PATH - 1]);
-    res = ExpandEnvironmentStringsForUserW(self_token_handle, path.c_str(), tmp_buf.get(), MAX_PATH - 1);
-    if (res)
-    {
-        return tmp_buf.get();
-    }
-    return path;
+    return Path;
 }
 
-bool Fs_WriteFile(const fs::path& filePath, const std::string& data, bool force)
+template<typename T>
+static bool Fs_WriteFileEx(const fs::path &filePath, const T& data, bool force)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(filePath);
-    DWORD attributes = force ? CREATE_ALWAYS : CREATE_NEW;
+    const auto  expanded_path = Fs_ExpandPath(filePath);
+          DWORD dw_written    = 0,
+                attributes    = force ? CREATE_ALWAYS : CREATE_NEW;
     auto h_File = CreateFileW(expanded_path.c_str(), GENERIC_WRITE, 0, nullptr, attributes, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
         return false;
     }
-    std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }}};
-    DWORD dw_written = 0;
+    MakeScopeGuard([&] { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }});
     if (!WriteFile(h_File, data.data(), static_cast<DWORD>(data.size()), &dw_written, nullptr) || dw_written == 0)
     {
         return false;
@@ -91,101 +69,123 @@ bool Fs_WriteFile(const fs::path& filePath, const std::string& data, bool force)
     return true;
 }
 
-bool Fs_ReadFile(const fs::path& filePath, std::string& data)
+template<typename T>
+static bool Fs_ReadFileEx(const fs::path &filePath, T& data, bool silent)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(filePath);
+    const auto              expanded_path   = Fs_ExpandPath(filePath);
+          fs::FileMetadata  file_attributes;
+          DWORD             dw_read         = 0;
+          LARGE_INTEGER     li_size         = {};
+    ZeroMemory(&file_attributes, sizeof(fs::FileMetadata));
+
     auto h_File = CreateFileW(expanded_path.c_str(), GENERIC_READ, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
         return false;
     }
-    std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }}};
-    LARGE_INTEGER li_Size;
-    if (!GetFileSizeEx(h_File, &li_Size))
+    MakeScopeGuard([&] { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }});
+    if (silent && !Fs_GetFileMetadata(filePath, file_attributes))
     {
         return false;
     }
-    DWORD dw_read = 0;
-    DWORD dw_size = static_cast<DWORD>(li_Size.QuadPart);
-    std::unique_ptr<char[]> tmp_buf(new char[li_Size.QuadPart]);
-    if (!ReadFile(h_File, tmp_buf.get(), dw_size, &dw_read, nullptr))
+    if (!GetFileSizeEx(h_File, &li_size))
     {
         return false;
     }
-    data.clear();
-    data.resize(dw_read);
-    memcpy((void*)(data.data()), (void*)tmp_buf.get(), dw_read);
+    data.resize(li_size.QuadPart / sizeof(T::value_type));
+    if (!ReadFile(h_File, data.data(), static_cast<DWORD>(li_size.QuadPart), &dw_read, nullptr))
+    {
+        data.resize(0);
+        return false;
+    }
+    if (silent && !Fs_SetFileMetadata(filePath, file_attributes))
+    {
+        data.resize(0);
+        return false;
+    }
     return true;
 }
 
-bool Fs_AppendFile(const fs::path& filePath, const std::string& data)
+template<typename T>
+static bool Fs_AppendFileEx(const fs::path &filePath, const T& data, bool silent)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(filePath);
-    auto h_File = CreateFileW(expanded_path.c_str(), GENERIC_WRITE, 0, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const auto              last_error    = GetLastError();
+    const auto              expanded_path = Fs_ExpandPath(filePath);
+          fs::FileMetadata  file_attributes;
+          DWORD             dw_written    = 0;
+
+    ZeroMemory(&file_attributes, sizeof(fs::FileMetadata));
+    MakeScopeGuard([&] { SetLastError(last_error); } );
+
+    auto h_File = CreateFileW(expanded_path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, nullptr, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
         return false;
     }
-    std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }}};
-    LARGE_INTEGER li_Size;
-    if (!GetFileSizeEx(h_File, &li_Size))
+    MakeScopeGuard([&] { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }});
+    if (SetFilePointer(h_File, 0, nullptr, FILE_END) == INVALID_SET_FILE_POINTER)
     {
         return false;
     }
-    DWORD dw_written = 0;
-    if (!WriteFile(h_File, data.data(), static_cast<DWORD>(data.size()), &dw_written, nullptr) || dw_written == 0)
+    if (silent && !Fs_GetFileMetadata(filePath, file_attributes))
+    {
+        return false;
+    }
+    if (!WriteFile(h_File, data.data(), static_cast<DWORD>(data.size()) * static_cast<DWORD>(sizeof(data.data()[0])), &dw_written, nullptr) || dw_written == 0)
+    {
+        return false;
+    }
+    if (silent && !Fs_SetFileMetadata(filePath, file_attributes))
+    {
+        return true;
+    }
+    return true;
+}
+
+LIB_EXPORT
+bool Fs_DeleteFile(const fs::path &filePath)
+{
+    const auto expanded_path = Fs_ExpandPath(filePath);
+    if (!DeleteFileW(expanded_path.wstring().c_str()))
     {
         return false;
     }
     return true;
 }
 
-bool Fs_DeleteFile(const fs::path& filePath)
+LIB_EXPORT
+bool Fs_RemoveDir(const fs::path &Path, bool recursive)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(filePath);
-    if (!DeleteFileW(expanded_path.c_str()))
-    {
-        return false;
-    }
-    return true;
-}
-
-bool Fs_RemoveDir(const fs::path& path, bool recursive)
-{
-    fs::path expanded_path = Fs_GetMountPointPath(path);
-    if (!Fs_IsDirectory(expanded_path))
-    {
-        expanded_path = expanded_path.parent_path();
-    }
-    bool ret = true;
+    const auto expanded_path = Fs_ExpandPath(Path);
+          bool ret           = true,
+               is_dir        = Fs_IsDirectory(expanded_path);
     if (recursive)
     {
-        auto dir_data = Fs_EnumDir(expanded_path);
+        const auto dir_data = Fs_EnumDir(expanded_path);
         for (auto& it : dir_data)
         {
-            const fs::path it_expanded = expanded_path / it;
-            if (Fs_IsDirectory(it_expanded.c_str()))
+            const fs::path it_path = expanded_path / it;
+            if (Fs_IsDirectory(it_path))
             {
-                Fs_RemoveDir(it_expanded.c_str());
-                continue;
+                ret &= Fs_RemoveDir(it_path);
             }
-            if (!DeleteFileW(it_expanded.c_str()))
+            else
             {
-                ret = false;
-                break;
+                ret &= (DeleteFileW(it_path.wstring().c_str()) >= TRUE);
             }
         }
+        return ret && RemoveDirectoryW(expanded_path.wstring().c_str());
     }
-    if (!RemoveDirectoryW(expanded_path.c_str()))
+    else
     {
-        return false;
+        return RemoveDirectoryW(expanded_path.wstring().c_str());
     }
-    return ret;
 }
 
-bool Fs_IsDirectory(const fs::path& path)
+LIB_EXPORT
+bool Fs_IsDirectory(const fs::path &Path)
 {
-    const auto& expanded_path = Fs_GetMountPointPath(path);
+    const auto& expanded_path = Fs_ExpandPath(Path);
     if (GetFileAttributesW(expanded_path.c_str()) & FILE_ATTRIBUTE_DIRECTORY)
     {
         return true;
@@ -193,11 +193,12 @@ bool Fs_IsDirectory(const fs::path& path)
     return false;
 }
 
-bool Fs_IsExist(const fs::path& path)
+LIB_EXPORT
+bool Fs_IsExist(const fs::path &Path)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(path);
-    DWORD dw_attrib = GetFileAttributesW(expanded_path.c_str());
-    bool exist = (dw_attrib != INVALID_FILE_ATTRIBUTES && (dw_attrib & FILE_ATTRIBUTE_DIRECTORY));
+    const auto  expanded_path   = Fs_ExpandPath(Path);
+    const DWORD dw_attrib       = GetFileAttributesW(expanded_path.c_str());
+          bool  exist           = (dw_attrib != INVALID_FILE_ATTRIBUTES && (dw_attrib & FILE_ATTRIBUTE_DIRECTORY));
     if (!exist)
     {
         auto h_File = CreateFileW(expanded_path.c_str(), FILE_READ_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -205,86 +206,83 @@ bool Fs_IsExist(const fs::path& path)
         {
             return false;
         }
-        std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }}};
+        CloseHandle(h_File);
         exist = true;
     }
     return exist;
 }
 
-bool Fs_CreateDirectory(const fs::path& path, bool recirsive)
+LIB_EXPORT
+bool Fs_CreateDirectory(const fs::path &Path, bool recirsive)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(path);
-    while(!Fs_IsExist(expanded_path.parent_path()) && recirsive)
+    const auto expanded_path = Fs_ExpandPath(Path);
+    while(recirsive && !Fs_IsExist(expanded_path.parent_path()))
     {
         if (!Fs_CreateDirectory(expanded_path.parent_path()))
         {
             return false;
         }
     }
-    if (!CreateDirectoryW(expanded_path.c_str(), {}))
+    if (!CreateDirectoryW(expanded_path.c_str(), nullptr))
     {
         return false;
     }
     return true;
 }
 
-bool Fs_GetFileMetadata(const fs::path& path, fs::File_Metadata& attributes)
+LIB_EXPORT
+bool Fs_GetFileMetadata(const fs::path &Path, fs::FileMetadata& attributes)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(path);
+    const auto                      expanded_path = Fs_ExpandPath(Path);
+          FILE_ATTRIBUTE_TAG_INFO   attrib_tag;
+    ZeroMemory(&attrib_tag, sizeof(FILE_ATTRIBUTE_TAG_INFO));
+
     auto h_File = CreateFileW(expanded_path.c_str(), FILE_READ_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
         return false;
     }
-    std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }}};
-    if (!GetFileTime(h_File, &attributes.CreationTime, &attributes.LastAccessTime, &attributes.LastWriteTime))
+    MakeScopeGuard([&] {if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }});
+    if (!GetFileInformationByHandleEx(h_File, FILE_INFO_BY_HANDLE_CLASS::FileAttributeTagInfo, &attrib_tag, sizeof(FILE_ATTRIBUTE_TAG_INFO)))
     {
         return false;
     }
-    FILE_ATTRIBUTE_TAG_INFO atrrib_tag = {};
-    if (!GetFileInformationByHandleEx(h_File, FILE_INFO_BY_HANDLE_CLASS::FileAttributeTagInfo, &atrrib_tag, sizeof(FILE_ATTRIBUTE_TAG_INFO)))
+    attributes.FileAttributes = attrib_tag.FileAttributes;
+    if (!GetFileTime(h_File, &attributes.CreationTime.ft, &attributes.LastAccessTime.ft, &attributes.LastWriteTime.ft))
     {
         return false;
     }
-    attributes.FileAttributes = atrrib_tag.FileAttributes;
     return true;
 }
 
-bool Fs_SetFileMetadata(const fs::path& path, const fs::File_Metadata& attributes)
+LIB_EXPORT
+bool Fs_SetFileMetadata(const fs::path &Path, const fs::FileMetadata& attributes)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(path);
-    auto h_File = CreateFileW(expanded_path.c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    const auto expanded_path = Fs_ExpandPath(Path);
+          auto h_File        = CreateFileW(expanded_path.c_str(), FILE_WRITE_ATTRIBUTES, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
     if (!h_File || h_File == INVALID_HANDLE_VALUE)
     {
         return false;
     }
-    std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) { if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }}};
-    FILE_ATTRIBUTE_TAG_INFO atrrib_tag = {};
-    atrrib_tag.FileAttributes = attributes.FileAttributes;
-    if (!GetFileInformationByHandleEx(h_File, FILE_INFO_BY_HANDLE_CLASS::FileAttributeTagInfo, &atrrib_tag, sizeof(FILE_ATTRIBUTE_TAG_INFO)))
-    {
-        return false;
-    }
-    if (!SetFileTime(h_File, &attributes.CreationTime, &attributes.LastAccessTime, &attributes.LastWriteTime))
+    MakeScopeGuard([&] {if (h_File && h_File != INVALID_HANDLE_VALUE) { CloseHandle(h_File); h_File = nullptr; }});
+    // "attributes.FileAttributes" can be used only by GetFileInformationByHandleEx
+    if (!SetFileTime(h_File, &attributes.CreationTime.ft, &attributes.LastAccessTime.ft, &attributes.LastWriteTime.ft))
     {
         return false;
     }
     return true;
 }
 
-const std::vector<fs::path> Fs_EnumDir(const fs::path& path)
+LIB_EXPORT
+const std::vector<fs::path> Fs_EnumDir(const fs::path &Path, const std::wstring& regFilter)
 {
-    fs::path expanded_path = Fs_GetMountPointPath(path);
-    if (!Fs_IsDirectory(expanded_path))
-    {
-        expanded_path = expanded_path.parent_path();
-    }
-    bool ret = true;
-    std::vector<fs::path> ret_vec;
-    const fs::path file_pattern = expanded_path / L"*";
-    WIN32_FIND_DATAW file_info = {};
+    const auto                  file_pattern = Fs_ExpandPath(Path) / L"*";
+          bool                  ret          = true;
+          WIN32_FIND_DATAW      file_info;
+          std::vector<fs::path> ret_vec;
+    ZeroMemory(&file_info, sizeof(WIN32_FIND_DATAW));
     auto h_File = FindFirstFileW(file_pattern.c_str(), &file_info);
-    std::shared_ptr<void> _{nullptr, [&]([[maybe_unused]] void* ptr) { if (h_File && h_File != INVALID_HANDLE_VALUE) { FindClose(h_File); h_File = nullptr; }}};
+    MakeScopeGuard([&] { if (h_File && h_File != INVALID_HANDLE_VALUE) { FindClose(h_File); h_File = nullptr; }});
     // Skipping /. && /..
 #if _HAS_CXX17
     while (std::wstring_view(file_info.cFileName) == L"." || std::wstring_view(file_info.cFileName) == L"..")
@@ -300,7 +298,92 @@ const std::vector<fs::path> Fs_EnumDir(const fs::path& path)
     }
     do
     {
+        if (!regFilter.empty() && !std::regex_match(file_info.cFileName, std::wregex(regFilter)))
+        {
+            continue;
+        }
         ret_vec.push_back(file_info.cFileName);
     } while (FindNextFileW(h_File, &file_info));
     return ret_vec;
+}
+
+#else // Unix like systems
+
+template<typename T>
+static bool Fs_WriteFileEx(const fs::path &filePath, const T& data, bool force)
+{
+    return false;
+}
+
+template<typename T>
+static bool Fs_ReadFileEx(const fs::path &filePath, const T& data, bool force)
+{
+
+
+
+    return false;
+}
+
+template<typename T>
+static bool Fs_AppendFileEx(const fs::path &filePath, const T& data, bool force)
+{
+    return false;
+}
+
+#endif
+
+
+// Platform independent calls
+LIB_EXPORT
+bool Fs_WriteFile(const fs::path &filePath, const std::string &data, bool force)
+{
+    return Fs_WriteFileEx(filePath, data, force);
+}
+
+LIB_EXPORT
+bool Fs_WriteFile(const fs::path &filePath, const std::wstring &data, bool force)
+{
+    return Fs_WriteFileEx(filePath, data, force);
+}
+
+LIB_EXPORT
+bool Fs_WriteFile(const fs::path &filePath, const std::vector<uint8_t> &data, bool force)
+{
+    return Fs_WriteFileEx(filePath, data, force);
+}
+
+LIB_EXPORT
+bool Fs_ReadFile(const fs::path &filePath, std::string &data, bool silent)
+{
+    return Fs_ReadFileEx(filePath, data, silent);
+}
+
+LIB_EXPORT
+bool Fs_ReadFile(const fs::path &filePath, std::wstring &data, bool silent)
+{
+    return Fs_ReadFileEx(filePath, data, silent);
+}
+
+LIB_EXPORT
+bool Fs_ReadFile(const fs::path &filePath, std::vector<uint8_t> &data, bool silent)
+{
+    return Fs_ReadFileEx(filePath, data, silent);
+}
+
+LIB_EXPORT
+bool Fs_AppendFile(const fs::path &filePath, const std::string &data, bool silent)
+{
+    return Fs_AppendFileEx(filePath, data, silent);
+}
+
+LIB_EXPORT
+bool Fs_AppendFile(const fs::path &filePath, const std::wstring &data, bool silent)
+{
+    return Fs_AppendFileEx(filePath, data, silent);
+}
+
+LIB_EXPORT
+bool Fs_AppendFile(const fs::path &filePath, const std::vector<uint8_t> &data, bool silent)
+{
+    return Fs_AppendFileEx(filePath, data, silent);
 }
