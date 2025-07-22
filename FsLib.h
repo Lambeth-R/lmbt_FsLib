@@ -1,34 +1,116 @@
 #pragma once
 #include "../../Include/Common.h"
 
-#ifdef _MSC_VER
-#include <Windows.h>
-#else
+#define FS_USE_POSIX
 
+#if defined PLATFORM_WIN
+#define FS_USE_WINAPI
+#include <Windows.h>
 #endif
 
+#if (!defined FS_USE_POSIX) && (!defined FS_USE_WINAPI)
+#error Define FS environment
+#endif
+
+#include <algorithm>
 #include <string>
+#include <list>
 #include <vector>
-#if _CPP_VERSION >= 201703L
+#include <regex>
+#if defined IS_CPP_17G
 #include <filesystem>
-#elif _CPP_VERSION >= 201402L
-#define INCLUDE_STD_FILESYSTEM_EXPERIMENTAL 1
-#define _SILENCE_EXPERIMENTAL_FILESYSTEM_DEPRECATION_WARNING
-#include <experimental/filesystem>
+#include <string_view>
 #else
 #error Unsupported.
 #endif
 
-namespace fs 
-{
-#if _CPP_VERSION >= 201703L
-    using path = std::filesystem::path;
+#if defined FS_USE_WINAPI
+#define FS_APENDIX winapi
 #else
-    using path = std::experimental::filesystem::v1::path;
+#define FS_APENDIX posix
 #endif
-#ifdef _MSC_VER
 
-    struct FileMetadata
+#define DEFINE_FUNCTION_RESOLVED_BODY( pref_ , post_ , arg_ ) \
+    { return FS_APENDIX::pref_##post_(filePath, data, arg_); }
+
+#if defined IS_CPP_20G
+#define DEFINE_HEAD_OUT_OPS_20( name_ , _arg ) \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, const std::span<const std::byte> &data, const bool _arg = false);
+
+#define DEFINE_MAIN_OUT_OPS_20(name_ , _arg) \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, const std::span<const std::byte> &data, const bool _arg) \
+        { return name_##FileEx(filePath, data, _arg); }
+#else
+#define DEFINE_HEAD_OUT_OPS_20( name_ , _arg );
+#define DEFINE_MAIN_OUT_OPS_20( name_ , _arg );
+#endif
+
+#if defined IS_CPP_17G
+#define DEFINE_HEAD_OUT_OPS_17( name_ , _arg ) \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::string_view data, const bool _arg = false);  \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::wstring_view data, const bool _arg = false);
+
+#define DEFINE_MAIN_OUT_OPS_17(name_ , _arg)            \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::string_view data, const bool _arg)  \
+        { return name_##FileEx(filePath, data, _arg); } \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::wstring_view data, const bool _arg) \
+        { return name_##FileEx(filePath, data, _arg); }
+#else
+#define DEFINE_HEAD_OUT_OPS_17( name_ , _arg );
+#define DEFINE_MAIN_OUT_OPS_17( name_ , _arg );
+#endif
+
+#define DEFINE_MAIN_OUT_OPS( name_ , _arg ) \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, const std::vector<uint8_t> &data, bool _arg)  \
+        { return name_##FileEx(filePath, data, _arg); }                                                 \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, const std::string &data, const bool _arg)     \
+        { return name_##FileEx(filePath, data, _arg); }                                                 \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, const std::wstring &data, const bool _arg)    \
+        { return name_##FileEx(filePath, data, _arg); }                                                 \
+    DEFINE_MAIN_OUT_OPS_17(name_ , _arg) \
+    DEFINE_MAIN_OUT_OPS_20(name_ , _arg)
+
+#define DEFINE_MAIN_IN_OPS( name_ , _arg ) \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::vector<uint8_t> &data, const bool _arg)  \
+        { return name_##FileEx(filePath, data, _arg); }                                                 \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::string &data, const bool _arg)           \
+        { return name_##FileEx(filePath, data, _arg); }                                                 \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::wstring &data, const bool _arg)          \
+        { return name_##FileEx(filePath, data, _arg); }
+
+#define DEFINE_HEAD_OUT_OPS_14( name_ , _arg ) \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, const std::vector<uint8_t> &data, const bool _arg = false);   \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, const std::string &data, const bool _arg = false);            \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, const std::wstring &data, const bool _arg = false);           \
+
+#define DEFINE_HEAD_IN_OPS_14( name_ , _arg ) \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::vector<uint8_t> &data, const bool _arg = false);   \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::string &data, const bool _arg = false);            \
+    LIB_EXPORT bool name_##File(const fs::path &filePath, std::wstring &data, const bool _arg = false);           \
+
+#define DEFINE_HEAD_OUT_OPS(name_ , _arg)    \
+        DEFINE_HEAD_OUT_OPS_14(name_ , _arg) \
+        DEFINE_HEAD_OUT_OPS_17(name_ , _arg) \
+        DEFINE_HEAD_OUT_OPS_20(name_ , _arg)
+
+#define DEFINE_COMMON_FS() \
+        DEFINE_HEAD_OUT_OPS(write, force)       \
+        DEFINE_HEAD_OUT_OPS(append, silent)     \
+        DEFINE_HEAD_IN_OPS_14(read, silent)     \
+        LIB_EXPORT const fs::path               expandPath(const fs::path &Path);       \
+        LIB_EXPORT bool                         removeFile(const fs::path &filePath);   \
+        LIB_EXPORT bool                         removeDir(const fs::path &Path, const bool recursive = true);       \
+        LIB_EXPORT bool                         isDirectory(const fs::path &Path);      \
+        LIB_EXPORT bool                         isExist(const fs::path &Path);          \
+        LIB_EXPORT bool                         createDirectory(const fs::path &Path, const bool recirsive = true); \
+        LIB_EXPORT const std::list<fs::path>    enumDir(const fs::path &Path, const std::string &regFilter = {});
+
+
+namespace fs
+{
+    using path = std::filesystem::path;
+#if defined PLATFORM_WIN
+    struct file_metadata
     {
         typedef union
         {
@@ -41,64 +123,18 @@ namespace fs
         var ChangeTime;
         uint32_t FileAttributes;
     };
+    // platform specific api
+    namespace winapi
+    {
+        LIB_EXPORT const fs::path   getMountPointPath(const fs::path &Path);
+        LIB_EXPORT bool             getFileMetadata(const fs::path &Path, fs::file_metadata &attributes);
+        LIB_EXPORT bool             setFileMetadata(const fs::path &Path, const fs::file_metadata &attributes);
+        DEFINE_COMMON_FS()
+    };
 #endif
+    namespace posix
+    {
+        DEFINE_COMMON_FS()
+    };
+    DEFINE_COMMON_FS()
 }
-
-LIB_EXPORT
-const fs::path Fs_GetMountPointPath(const fs::path &Path);
-
-LIB_EXPORT
-const fs::path Fs_ExpandPath(const fs::path &Path);
-
-LIB_EXPORT
-bool Fs_WriteFile(const fs::path &filePath, const std::string &data, bool force = false);
-
-LIB_EXPORT
-bool Fs_WriteFile(const fs::path &filePath, const std::wstring &data, bool force = false);
-
-LIB_EXPORT
-bool Fs_WriteFile(const fs::path &filePath, const std::vector<uint8_t> &data, bool force = false);
-
-LIB_EXPORT
-bool Fs_ReadFile(const fs::path &filePath, std::string &data, bool silent = false);
-
-LIB_EXPORT
-bool Fs_ReadFile(const fs::path &filePath, std::wstring &data, bool silent = false);
-
-LIB_EXPORT
-bool Fs_ReadFile(const fs::path &filePath, std::vector<uint8_t> &data, bool silent = false);
-
-LIB_EXPORT
-bool Fs_AppendFile(const fs::path &filePath, const std::string &data, bool silent = false);
-
-LIB_EXPORT
-bool Fs_AppendFile(const fs::path &filePath, const std::wstring &data, bool silent = false);
-
-LIB_EXPORT
-bool Fs_AppendFile(const fs::path &filePath, const std::vector<uint8_t> &data, bool silent = false);
-
-LIB_EXPORT
-bool Fs_DeleteFile(const fs::path &filePath);
-
-LIB_EXPORT
-bool Fs_RemoveDir(const fs::path &Path, bool recursive = true);
-
-LIB_EXPORT
-bool Fs_IsDirectory(const fs::path &Path);
-
-LIB_EXPORT
-bool Fs_IsExist(const fs::path &Path);
-
-LIB_EXPORT
-bool Fs_CreateDirectory(const fs::path &Path, bool recirsive = true);
-
-LIB_EXPORT
-const std::vector<fs::path> Fs_EnumDir(const fs::path& Path, const std::wstring& regFilter = {}); // add filter
-
-#ifdef _MSC_VER
-LIB_EXPORT
-bool Fs_GetFileMetadata(const fs::path &Path, fs::FileMetadata &attributes);
-
-LIB_EXPORT
-bool Fs_SetFileMetadata(const fs::path &Path, const fs::FileMetadata &attributes);
-#endif
